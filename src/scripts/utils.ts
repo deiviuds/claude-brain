@@ -31,7 +31,6 @@ export function isCorruptedMemoryError(error: unknown): boolean {
   return (
     errorMessage.includes("Deserialization") ||
     errorMessage.includes("UnexpectedVariant") ||
-    errorMessage.includes("Invalid") ||
     errorMessage.includes("corrupt") ||
     errorMessage.includes("version mismatch")
   );
