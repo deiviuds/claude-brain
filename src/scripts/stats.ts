@@ -5,12 +5,36 @@
  * Get memory statistics using the SDK (no CLI dependency)
  */
 
-import { statSync } from "node:fs";
-import { resolve } from "node:path";
-import { openMemorySafely } from "./utils";
+import { statSync, existsSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+import { execSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { openMemorySafely } from "./utils.js";
+
+// Ensure dependencies are installed before importing SDK
+async function ensureDeps() {
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const pluginRoot = resolve(__dirname, "../..");
+  const sdkPath = resolve(pluginRoot, "node_modules/@memvid/sdk");
+
+  if (!existsSync(sdkPath)) {
+    console.log("Installing dependencies...");
+    try {
+      execSync("npm install --production --no-fund --no-audit", {
+        cwd: pluginRoot,
+        stdio: "inherit",
+        timeout: 120000,
+      });
+    } catch {
+      console.error("Failed to install dependencies. Please run: npm install");
+      process.exit(1);
+    }
+  }
+}
 
 // Dynamic import for SDK
 async function loadSDK() {
+  await ensureDeps();
   return await import("@memvid/sdk");
 }
 

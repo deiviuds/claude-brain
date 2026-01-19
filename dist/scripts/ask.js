@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-import { resolve, dirname } from 'path';
 import { existsSync, mkdirSync, renameSync, unlinkSync } from 'fs';
+import { resolve, dirname } from 'path';
+import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
 
 async function createFreshMemory(memoryPath, create) {
   const memoryDir = dirname(memoryPath);
@@ -46,7 +48,26 @@ async function openMemorySafely(memoryPath, use, create) {
 }
 
 // src/scripts/ask.ts
+async function ensureDeps() {
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const pluginRoot = resolve(__dirname, "../..");
+  const sdkPath = resolve(pluginRoot, "node_modules/@memvid/sdk");
+  if (!existsSync(sdkPath)) {
+    console.log("Installing dependencies...");
+    try {
+      execSync("npm install --production --no-fund --no-audit", {
+        cwd: pluginRoot,
+        stdio: "inherit",
+        timeout: 12e4
+      });
+    } catch {
+      console.error("Failed to install dependencies. Please run: npm install");
+      process.exit(1);
+    }
+  }
+}
 async function loadSDK() {
+  await ensureDeps();
   return await import('@memvid/sdk');
 }
 async function main() {

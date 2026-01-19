@@ -1,6 +1,6 @@
 {
   "name": "claude-brain",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "Give Claude Code photographic memory in ONE portable file",
   "type": "module",
   "main": "dist/index.js",
