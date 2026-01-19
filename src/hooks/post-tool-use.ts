@@ -38,6 +38,35 @@ const OBSERVED_TOOLS = new Set([
 // Minimum output length to consider capturing
 const MIN_OUTPUT_LENGTH = 50;
 
+// Simple in-memory dedup cache to avoid storing duplicate observations
+// Key: hash of tool+input, Value: timestamp of last capture
+const recentObservations = new Map<string, number>();
+const DEDUP_WINDOW_MS = 60000; // 1 minute - don't re-capture same thing within this window
+
+function getObservationKey(toolName: string, toolInput: Record<string, unknown> | undefined): string {
+  const inputStr = toolInput ? JSON.stringify(toolInput).slice(0, 200) : "";
+  return `${toolName}:${inputStr}`;
+}
+
+function isDuplicate(key: string): boolean {
+  const lastSeen = recentObservations.get(key);
+  if (!lastSeen) return false;
+  return Date.now() - lastSeen < DEDUP_WINDOW_MS;
+}
+
+function markObserved(key: string): void {
+  recentObservations.set(key, Date.now());
+  // Clean old entries
+  if (recentObservations.size > 100) {
+    const now = Date.now();
+    for (const [k, v] of recentObservations.entries()) {
+      if (now - v > DEDUP_WINDOW_MS * 2) {
+        recentObservations.delete(k);
+      }
+    }
+  }
+}
+
 // Tools that should ALWAYS be captured regardless of output length
 const ALWAYS_CAPTURE_TOOLS = new Set(["Edit", "Write", "Update", "NotebookEdit"]);
 
@@ -58,6 +87,14 @@ async function main() {
     // Skip if not a tool we observe
     if (!tool_name || !OBSERVED_TOOLS.has(tool_name)) {
       debug(`Skipping tool: ${tool_name} (not in OBSERVED_TOOLS)`);
+      writeOutput({ continue: true });
+      return;
+    }
+
+    // Deduplication check - avoid storing the same observation within a short window
+    const dedupKey = getObservationKey(tool_name, tool_input);
+    if (isDuplicate(dedupKey)) {
+      debug(`Skipping duplicate observation: ${tool_name}`);
       writeOutput({ continue: true });
       return;
     }
@@ -135,6 +172,9 @@ async function main() {
       tool: tool_name,
       metadata,
     });
+
+    // Mark as observed for deduplication
+    markObserved(dedupKey);
 
     debug(`Stored: [${observationType}] ${summary}${wasCompressed ? " (compressed)" : ""}`);
 

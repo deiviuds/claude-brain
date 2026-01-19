@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { existsSync } from 'fs';
+import { readdirSync, unlinkSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
-import { mkdir } from 'fs/promises';
+import { mkdir, open } from 'fs/promises';
 import { randomBytes } from 'crypto';
+import lockfile from 'proper-lockfile';
 
 // src/types.ts
 var DEFAULT_CONFIG = {
@@ -63,8 +64,48 @@ function classifyObservationType(toolName, output) {
       return "discovery";
   }
 }
+var LOCK_OPTIONS = {
+  stale: 3e4,
+  retries: {
+    retries: 1e3,
+    minTimeout: 5,
+    maxTimeout: 50
+  }
+};
+async function withMemvidLock(lockPath, fn) {
+  await mkdir(dirname(lockPath), { recursive: true });
+  const handle = await open(lockPath, "a");
+  await handle.close();
+  const release = await lockfile.lock(lockPath, LOCK_OPTIONS);
+  try {
+    return await fn();
+  } finally {
+    await release();
+  }
+}
 
 // src/core/mind.ts
+function pruneBackups(memoryPath, keepCount) {
+  try {
+    const dir = dirname(memoryPath);
+    const baseName = memoryPath.split("/").pop() || "mind.mv2";
+    const backupPattern = new RegExp(`^${baseName.replace(".", "\\.")}\\.backup-\\d+$`);
+    const files = readdirSync(dir);
+    const backups = files.filter((f) => backupPattern.test(f)).map((f) => ({
+      name: f,
+      path: resolve(dir, f),
+      time: parseInt(f.split("-").pop() || "0", 10)
+    })).sort((a, b) => b.time - a.time);
+    for (let i = keepCount; i < backups.length; i++) {
+      try {
+        unlinkSync(backups[i].path);
+        console.error(`[memvid-mind] Pruned old backup: ${backups[i].name}`);
+      } catch {
+      }
+    }
+  } catch {
+  }
+}
 var sdkLoaded = false;
 var use;
 var create;
@@ -97,10 +138,13 @@ var Mind = class _Mind {
     await mkdir(memoryDir, { recursive: true });
     let memvid;
     const MAX_FILE_SIZE_MB = 100;
-    if (!existsSync(memoryPath)) {
-      memvid = await create(memoryPath, "basic");
-    } else {
-      const { statSync, renameSync, unlinkSync } = await import('fs');
+    const lockPath = `${memoryPath}.lock`;
+    await withMemvidLock(lockPath, async () => {
+      if (!existsSync(memoryPath)) {
+        memvid = await create(memoryPath, "basic");
+        return;
+      }
+      const { statSync, renameSync, unlinkSync: unlinkSync2 } = await import('fs');
       const fileSize = statSync(memoryPath).size;
       const fileSizeMB = fileSize / (1024 * 1024);
       if (fileSizeMB > MAX_FILE_SIZE_MB) {
@@ -111,35 +155,41 @@ var Mind = class _Mind {
         } catch {
         }
         memvid = await create(memoryPath, "basic");
-      } else {
-        try {
-          memvid = await use("basic", memoryPath);
-        } catch (openError) {
-          const errorMessage = openError instanceof Error ? openError.message : String(openError);
-          if (errorMessage.includes("Deserialization") || errorMessage.includes("UnexpectedVariant") || errorMessage.includes("Invalid") || errorMessage.includes("corrupt")) {
-            console.error("[memvid-mind] Memory file corrupted, creating fresh memory...");
-            const backupPath = `${memoryPath}.backup-${Date.now()}`;
-            try {
-              renameSync(memoryPath, backupPath);
-            } catch {
-              try {
-                unlinkSync(memoryPath);
-              } catch {
-              }
-            }
-            memvid = await create(memoryPath, "basic");
-          } else {
-            throw openError;
-          }
-        }
+        return;
       }
-    }
+      try {
+        memvid = await use("basic", memoryPath);
+      } catch (openError) {
+        const errorMessage = openError instanceof Error ? openError.message : String(openError);
+        if (errorMessage.includes("Deserialization") || errorMessage.includes("UnexpectedVariant") || errorMessage.includes("Invalid") || errorMessage.includes("corrupt") || errorMessage.includes("validation failed") || errorMessage.includes("unable to recover") || errorMessage.includes("table of contents")) {
+          console.error("[memvid-mind] Memory file corrupted, creating fresh memory...");
+          const backupPath = `${memoryPath}.backup-${Date.now()}`;
+          try {
+            renameSync(memoryPath, backupPath);
+          } catch {
+            try {
+              unlinkSync2(memoryPath);
+            } catch {
+            }
+          }
+          memvid = await create(memoryPath, "basic");
+          return;
+        }
+        throw openError;
+      }
+    });
     const mind = new _Mind(memvid, config);
     mind.initialized = true;
+    pruneBackups(memoryPath, 3);
     if (config.debug) {
       console.error(`[memvid-mind] Opened: ${memoryPath}`);
     }
     return mind;
+  }
+  async withLock(fn) {
+    const memoryPath = this.getMemoryPath();
+    const lockPath = `${memoryPath}.lock`;
+    return withMemvidLock(lockPath, fn);
   }
   /**
    * Remember an observation
@@ -157,18 +207,20 @@ var Mind = class _Mind {
         sessionId: this.sessionId
       }
     };
-    const frameId = await this.memvid.put({
-      title: `[${observation.type}] ${observation.summary}`,
-      label: observation.type,
-      text: observation.content,
-      metadata: {
-        observationId: observation.id,
-        timestamp: observation.timestamp,
-        tool: observation.tool,
-        sessionId: this.sessionId,
-        ...observation.metadata
-      },
-      tags: [observation.type, observation.tool].filter(Boolean)
+    const frameId = await this.withLock(async () => {
+      return this.memvid.put({
+        title: `[${observation.type}] ${observation.summary}`,
+        label: observation.type,
+        text: observation.content,
+        metadata: {
+          observationId: observation.id,
+          timestamp: observation.timestamp,
+          tool: observation.tool,
+          sessionId: this.sessionId,
+          ...observation.metadata
+        },
+        tags: [observation.type, observation.tool].filter(Boolean)
+      });
     });
     if (this.config.debug) {
       console.error(`[memvid-mind] Remembered: ${observation.summary}`);
@@ -179,6 +231,11 @@ var Mind = class _Mind {
    * Search memories by query (uses fast lexical search)
    */
   async search(query, limit = 10) {
+    return this.withLock(async () => {
+      return this.searchUnlocked(query, limit);
+    });
+  }
+  async searchUnlocked(query, limit) {
     const results = await this.memvid.find(query, { k: limit, mode: "lex" });
     return (results.frames || []).map((frame) => ({
       observation: {
@@ -198,54 +255,58 @@ var Mind = class _Mind {
    * Ask the memory a question (uses fast lexical search)
    */
   async ask(question) {
-    const result = await this.memvid.ask(question, { k: 5, mode: "lex" });
-    return result.answer || "No relevant memories found.";
+    return this.withLock(async () => {
+      const result = await this.memvid.ask(question, { k: 5, mode: "lex" });
+      return result.answer || "No relevant memories found.";
+    });
   }
   /**
    * Get context for session start
    */
   async getContext(query) {
-    const timeline = await this.memvid.timeline({
-      limit: this.config.maxContextObservations,
-      reverse: true
-    });
-    const frames = Array.isArray(timeline) ? timeline : timeline.frames || [];
-    const recentObservations = frames.map(
-      (frame) => {
-        let ts = frame.metadata?.timestamp || frame.timestamp || 0;
-        if (ts > 0 && ts < 4102444800) {
-          ts = ts * 1e3;
+    return this.withLock(async () => {
+      const timeline = await this.memvid.timeline({
+        limit: this.config.maxContextObservations,
+        reverse: true
+      });
+      const frames = Array.isArray(timeline) ? timeline : timeline.frames || [];
+      const recentObservations2 = frames.map(
+        (frame) => {
+          let ts = frame.metadata?.timestamp || frame.timestamp || 0;
+          if (ts > 0 && ts < 4102444800) {
+            ts = ts * 1e3;
+          }
+          return {
+            id: frame.metadata?.observationId || frame.frame_id,
+            timestamp: ts,
+            type: frame.label || frame.metadata?.type || "observation",
+            tool: frame.metadata?.tool,
+            summary: frame.title?.replace(/^\[.*?\]\s*/, "") || frame.preview?.slice(0, 100) || "",
+            content: frame.text || frame.preview || "",
+            metadata: frame.metadata
+          };
         }
-        return {
-          id: frame.metadata?.observationId || frame.frame_id,
-          timestamp: ts,
-          type: frame.label || frame.metadata?.type || "observation",
-          tool: frame.metadata?.tool,
-          summary: frame.title?.replace(/^\[.*?\]\s*/, "") || frame.preview?.slice(0, 100) || "",
-          content: frame.text || frame.preview || "",
-          metadata: frame.metadata
-        };
+      );
+      let relevantMemories = [];
+      if (query) {
+        const searchResults = await this.searchUnlocked(query, 10);
+        relevantMemories = searchResults.map((r) => r.observation);
       }
-    );
-    let relevantMemories = [];
-    if (query) {
-      const searchResults = await this.search(query, 10);
-      relevantMemories = searchResults.map((r) => r.observation);
-    }
-    let tokenCount = 0;
-    for (const obs of recentObservations) {
-      const text = `[${obs.type}] ${obs.summary}`;
-      const tokens = estimateTokens(text);
-      if (tokenCount + tokens > this.config.maxContextTokens) break;
-      tokenCount += tokens;
-    }
-    return {
-      recentObservations,
-      relevantMemories,
-      sessionSummaries: [],
-      // TODO: Implement session summaries
-      tokenCount
-    };
+      let tokenCount = 0;
+      for (const obs of recentObservations2) {
+        const text = `[${obs.type}] ${obs.summary}`;
+        const tokens = estimateTokens(text);
+        if (tokenCount + tokens > this.config.maxContextTokens) break;
+        tokenCount += tokens;
+      }
+      return {
+        recentObservations: recentObservations2,
+        relevantMemories,
+        sessionSummaries: [],
+        // TODO: Implement session summaries
+        tokenCount
+      };
+    });
   }
   /**
    * Save a session summary
@@ -262,33 +323,37 @@ var Mind = class _Mind {
       filesModified: summary.filesModified,
       summary: summary.summary
     };
-    return this.memvid.put({
-      title: `Session Summary: ${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}`,
-      label: "session",
-      text: JSON.stringify(sessionSummary, null, 2),
-      metadata: sessionSummary,
-      tags: ["session", "summary"]
+    return this.withLock(async () => {
+      return this.memvid.put({
+        title: `Session Summary: ${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}`,
+        label: "session",
+        text: JSON.stringify(sessionSummary, null, 2),
+        metadata: sessionSummary,
+        tags: ["session", "summary"]
+      });
     });
   }
   /**
    * Get memory statistics
    */
   async stats() {
-    const stats = await this.memvid.stats();
-    const timeline = await this.memvid.timeline({ limit: 1, reverse: false });
-    const recentTimeline = await this.memvid.timeline({ limit: 1, reverse: true });
-    const oldestFrames = Array.isArray(timeline) ? timeline : timeline.frames || [];
-    const newestFrames = Array.isArray(recentTimeline) ? recentTimeline : recentTimeline.frames || [];
-    return {
-      totalObservations: stats.frame_count || 0,
-      totalSessions: 0,
-      // TODO: Count unique sessions
-      oldestMemory: oldestFrames[0]?.metadata?.timestamp || oldestFrames[0]?.timestamp || 0,
-      newestMemory: newestFrames[0]?.metadata?.timestamp || newestFrames[0]?.timestamp || 0,
-      fileSize: stats.size_bytes || 0,
-      topTypes: {}
-      // TODO: Aggregate
-    };
+    return this.withLock(async () => {
+      const stats = await this.memvid.stats();
+      const timeline = await this.memvid.timeline({ limit: 1, reverse: false });
+      const recentTimeline = await this.memvid.timeline({ limit: 1, reverse: true });
+      const oldestFrames = Array.isArray(timeline) ? timeline : timeline.frames || [];
+      const newestFrames = Array.isArray(recentTimeline) ? recentTimeline : recentTimeline.frames || [];
+      return {
+        totalObservations: stats.frame_count || 0,
+        totalSessions: 0,
+        // TODO: Count unique sessions
+        oldestMemory: oldestFrames[0]?.metadata?.timestamp || oldestFrames[0]?.timestamp || 0,
+        newestMemory: newestFrames[0]?.metadata?.timestamp || newestFrames[0]?.timestamp || 0,
+        fileSize: stats.size_bytes || 0,
+        topTypes: {}
+        // TODO: Aggregate
+      };
+    });
   }
   /**
    * Get the session ID
@@ -608,6 +673,28 @@ var OBSERVED_TOOLS = /* @__PURE__ */ new Set([
   "NotebookEdit"
 ]);
 var MIN_OUTPUT_LENGTH = 50;
+var recentObservations = /* @__PURE__ */ new Map();
+var DEDUP_WINDOW_MS = 6e4;
+function getObservationKey(toolName, toolInput) {
+  const inputStr = toolInput ? JSON.stringify(toolInput).slice(0, 200) : "";
+  return `${toolName}:${inputStr}`;
+}
+function isDuplicate(key) {
+  const lastSeen = recentObservations.get(key);
+  if (!lastSeen) return false;
+  return Date.now() - lastSeen < DEDUP_WINDOW_MS;
+}
+function markObserved(key) {
+  recentObservations.set(key, Date.now());
+  if (recentObservations.size > 100) {
+    const now = Date.now();
+    for (const [k, v] of recentObservations.entries()) {
+      if (now - v > DEDUP_WINDOW_MS * 2) {
+        recentObservations.delete(k);
+      }
+    }
+  }
+}
 var ALWAYS_CAPTURE_TOOLS = /* @__PURE__ */ new Set(["Edit", "Write", "Update", "NotebookEdit"]);
 var MAX_OUTPUT_LENGTH = 2500;
 async function main() {
@@ -618,6 +705,12 @@ async function main() {
     debug(`Tool received: ${tool_name}`);
     if (!tool_name || !OBSERVED_TOOLS.has(tool_name)) {
       debug(`Skipping tool: ${tool_name} (not in OBSERVED_TOOLS)`);
+      writeOutput({ continue: true });
+      return;
+    }
+    const dedupKey = getObservationKey(tool_name, tool_input);
+    if (isDuplicate(dedupKey)) {
+      debug(`Skipping duplicate observation: ${tool_name}`);
       writeOutput({ continue: true });
       return;
     }
@@ -666,6 +759,7 @@ Tool: ${tool_name}`;
       tool: tool_name,
       metadata
     });
+    markObserved(dedupKey);
     debug(`Stored: [${observationType}] ${summary}${wasCompressed ? " (compressed)" : ""}`);
     writeOutput({ continue: true });
   } catch (error) {

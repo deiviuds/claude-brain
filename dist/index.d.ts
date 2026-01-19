@@ -127,6 +127,7 @@ declare class Mind {
      * Open or create a Mind instance
      */
     static open(configOverrides?: Partial<MindConfig>): Promise<Mind>;
+    private withLock;
     /**
      * Remember an observation
      */
@@ -141,6 +142,7 @@ declare class Mind {
      * Search memories by query (uses fast lexical search)
      */
     search(query: string, limit?: number): Promise<MemorySearchResult[]>;
+    private searchUnlocked;
     /**
      * Ask the memory a question (uses fast lexical search)
      */

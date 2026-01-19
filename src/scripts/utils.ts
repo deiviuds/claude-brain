@@ -33,7 +33,10 @@ export function isCorruptedMemoryError(error: unknown): boolean {
     errorMessage.includes("UnexpectedVariant") ||
     errorMessage.includes("Invalid") ||
     errorMessage.includes("corrupt") ||
-    errorMessage.includes("version mismatch")
+    errorMessage.includes("version mismatch") ||
+    errorMessage.includes("validation failed") ||
+    errorMessage.includes("unable to recover") ||
+    errorMessage.includes("table of contents")
   );
 }
 

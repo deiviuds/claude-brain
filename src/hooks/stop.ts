@@ -38,17 +38,20 @@ async function captureFileChanges(mind: Awaited<ReturnType<typeof getMind>>) {
     let gitDiffContent = "";
 
     // 1. Get git tracked changes (staged and unstaged)
+    // Use shorter timeouts to avoid blocking session end
     try {
-      const diffNames = execSync("git diff --name-only HEAD 2>/dev/null || git diff --name-only", {
+      const diffNames = execSync("git diff --name-only HEAD 2>/dev/null || git diff --name-only 2>/dev/null || echo ''", {
         cwd: workDir,
         encoding: "utf-8",
-        timeout: 5000,
+        timeout: 3000,
+        stdio: ['pipe', 'pipe', 'pipe'],
       }).trim();
 
-      const stagedNames = execSync("git diff --cached --name-only 2>/dev/null || true", {
+      const stagedNames = execSync("git diff --cached --name-only 2>/dev/null || echo ''", {
         cwd: workDir,
         encoding: "utf-8",
-        timeout: 5000,
+        timeout: 3000,
+        stdio: ['pipe', 'pipe', 'pipe'],
       }).trim();
 
       const gitFiles = [...new Set([
@@ -61,10 +64,11 @@ async function captureFileChanges(mind: Awaited<ReturnType<typeof getMind>>) {
       // Get git diff stat for tracked files
       if (gitFiles.length > 0) {
         try {
-          gitDiffContent = execSync("git diff HEAD --stat 2>/dev/null | head -50", {
+          gitDiffContent = execSync("git diff HEAD --stat 2>/dev/null | head -30", {
             cwd: workDir,
             encoding: "utf-8",
-            timeout: 10000,
+            timeout: 3000,
+            stdio: ['pipe', 'pipe', 'pipe'],
           }).trim();
         } catch {
           // Ignore
@@ -74,16 +78,18 @@ async function captureFileChanges(mind: Awaited<ReturnType<typeof getMind>>) {
       // Not a git repo or git not available - continue to find recent files
     }
 
-    // 2. Find recently modified files (last 60 minutes) in common code directories
+    // 2. Find recently modified files (last 30 minutes) in common code directories
     // This catches changes in untracked directories
     // Use -maxdepth to limit search and exclude common large dirs for speed
+    // Reduced timeout and scope to avoid hanging
     try {
       const recentFiles = execSync(
-        `find . -maxdepth 5 -type f \\( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" -o -name "*.md" -o -name "*.json" -o -name "*.py" -o -name "*.rs" \\) -mmin -60 ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/dist/*" ! -path "*/build/*" ! -path "*/.next/*" ! -path "*/target/*" 2>/dev/null | head -50`,
+        `find . -maxdepth 4 -type f \\( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" -o -name "*.md" -o -name "*.json" -o -name "*.py" -o -name "*.rs" \\) -mmin -30 ! -path "*/node_modules/*" ! -path "*/.git/*" ! -path "*/dist/*" ! -path "*/build/*" ! -path "*/.next/*" ! -path "*/target/*" 2>/dev/null | head -30`,
         {
           cwd: workDir,
           encoding: "utf-8",
-          timeout: 15000,
+          timeout: 5000,
+          stdio: ['pipe', 'pipe', 'pipe'],
         }
       ).trim();
 

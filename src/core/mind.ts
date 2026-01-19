@@ -9,7 +9,7 @@
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Memvid = any;
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, unlinkSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
 import {
@@ -24,6 +24,39 @@ import {
 } from "../types.js";
 import { generateId, estimateTokens } from "../utils/helpers.js";
 import { withMemvidLock } from "../utils/memvid-lock.js";
+
+/**
+ * Prune old backup files, keeping only the most recent N
+ */
+function pruneBackups(memoryPath: string, keepCount: number): void {
+  try {
+    const dir = dirname(memoryPath);
+    const baseName = memoryPath.split("/").pop() || "mind.mv2";
+    const backupPattern = new RegExp(`^${baseName.replace(".", "\\.")}\\.backup-\\d+$`);
+
+    const files = readdirSync(dir);
+    const backups = files
+      .filter(f => backupPattern.test(f))
+      .map(f => ({
+        name: f,
+        path: resolve(dir, f),
+        time: parseInt(f.split("-").pop() || "0", 10),
+      }))
+      .sort((a, b) => b.time - a.time); // newest first
+
+    // Delete old backups beyond keepCount
+    for (let i = keepCount; i < backups.length; i++) {
+      try {
+        unlinkSync(backups[i].path);
+        console.error(`[memvid-mind] Pruned old backup: ${backups[i].name}`);
+      } catch {
+        // Ignore errors deleting backups
+      }
+    }
+  } catch {
+    // Ignore errors during pruning
+  }
+}
 
 // Lazy-loaded SDK functions
 let sdkLoaded = false;
@@ -116,7 +149,10 @@ export class Mind {
         if (errorMessage.includes("Deserialization") ||
             errorMessage.includes("UnexpectedVariant") ||
             errorMessage.includes("Invalid") ||
-            errorMessage.includes("corrupt")) {
+            errorMessage.includes("corrupt") ||
+            errorMessage.includes("validation failed") ||
+            errorMessage.includes("unable to recover") ||
+            errorMessage.includes("table of contents")) {
           console.error("[memvid-mind] Memory file corrupted, creating fresh memory...");
           const backupPath = `${memoryPath}.backup-${Date.now()}`;
           try {
@@ -133,6 +169,9 @@ export class Mind {
 
     const mind = new Mind(memvid, config);
     mind.initialized = true;
+
+    // Prune old backups (keep only most recent 3)
+    pruneBackups(memoryPath, 3);
 
     if (config.debug) {
       console.error(`[memvid-mind] Opened: ${memoryPath}`);

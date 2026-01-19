@@ -1,6 +1,6 @@
 {
   "name": "claude-brain",
-  "version": "1.0.8",
+  "version": "1.0.10",
   "description": "Give Claude Code photographic memory in ONE portable file",
   "type": "module",
   "main": "dist/index.js",
@@ -44,7 +44,7 @@
     "url": "https://github.com/memvid/claude-brain/issues"
   },
   "dependencies": {
-    "@memvid/sdk": "^2.0.146",
+    "@memvid/sdk": "^2.0.149",
     "proper-lockfile": "^4.1.2"
   },
   "devDependencies": {

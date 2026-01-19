@@ -9,7 +9,7 @@ async function createFreshMemory(memoryPath, create) {
 }
 function isCorruptedMemoryError(error) {
   const errorMessage = error instanceof Error ? error.message : String(error);
-  return errorMessage.includes("Deserialization") || errorMessage.includes("UnexpectedVariant") || errorMessage.includes("Invalid") || errorMessage.includes("corrupt") || errorMessage.includes("version mismatch");
+  return errorMessage.includes("Deserialization") || errorMessage.includes("UnexpectedVariant") || errorMessage.includes("Invalid") || errorMessage.includes("corrupt") || errorMessage.includes("version mismatch") || errorMessage.includes("validation failed") || errorMessage.includes("unable to recover") || errorMessage.includes("table of contents");
 }
 async function handleCorruptedMemory(memoryPath, create) {
   console.log(
