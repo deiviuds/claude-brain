@@ -121,6 +121,21 @@ memvid timeline .claude/mind.mv2        # view timeline
 
 <br />
 
+## OpenCode Support
+
+Want to use this with OpenCode? Check out [**opencode-brain**](https://github.com/deiviuds/opencode-brain) - a fully compatible port that shares the same `.claude/mind.mv2` file format.
+
+Both tools can be used interchangeably on the same project.
+
+**Install:**
+```bash
+npm install opencode-brain
+```
+
+[View on npm →](https://www.npmjs.com/package/opencode-brain)
+
+<br />
+
 ## FAQ
 
 <details>
