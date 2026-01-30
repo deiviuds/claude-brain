@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import 'crypto';
+import { mkdir, open, writeFile } from 'fs/promises';
+import { basename, resolve, dirname } from 'path';
+import lockfile from 'proper-lockfile';
 import { existsSync, statSync } from 'fs';
-import { basename, resolve } from 'path';
 
 async function readStdin() {
   const chunks = [];
@@ -20,12 +22,62 @@ function debug(message) {
     console.error(`[memvid-mind] ${message}`);
   }
 }
+var LOCK_OPTIONS = {
+  stale: 3e4,
+  retries: {
+    retries: 1e3,
+    minTimeout: 5,
+    maxTimeout: 50
+  }
+};
+async function withMemvidLock(lockPath, fn) {
+  await mkdir(dirname(lockPath), { recursive: true });
+  const handle = await open(lockPath, "a");
+  await handle.close();
+  const release = await lockfile.lock(lockPath, LOCK_OPTIONS);
+  try {
+    return await fn();
+  } finally {
+    await release();
+  }
+}
+
+// src/utils/session.ts
+function getSessionPath(directory, source) {
+  return `${directory}/.claude/mind-session-${source}.json`;
+}
+function detectSource() {
+  if (process.env.OPENCODE_SESSION_ID) return "opencode";
+  if (process.env.OPENCODE_DIR) return "opencode";
+  if (process.env.CLAUDE_PROJECT_DIR && !process.env.OPENCODE_SESSION_ID) return "claude-code";
+  return "claude-code";
+}
+async function writeSessionInfo(directory, sessionId, source) {
+  const sessionPath = getSessionPath(directory, source);
+  const lockPath = `${sessionPath}.lock`;
+  await mkdir(dirname(sessionPath), { recursive: true });
+  await withMemvidLock(lockPath, async () => {
+    const info = {
+      sessionId,
+      source,
+      startTime: Date.now()
+    };
+    await writeFile(sessionPath, JSON.stringify(info));
+  });
+}
 async function main() {
   try {
     const input = await readStdin();
     const hookInput = JSON.parse(input);
     debug(`Session starting: ${hookInput.session_id}`);
     const projectDir = hookInput.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+    const source = detectSource();
+    try {
+      await writeSessionInfo(projectDir, hookInput.session_id, source);
+      debug(`Session info written: ${hookInput.session_id} (${source})`);
+    } catch (err) {
+      debug(`Failed to write session info: ${err}`);
+    }
     const projectName = basename(projectDir);
     const memoryPath = resolve(projectDir, ".claude/mind.mv2");
     const memoryExists = existsSync(memoryPath);

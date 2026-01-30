@@ -8,6 +8,7 @@
  */
 
 import { readStdin, writeOutput, debug } from "../utils/helpers.js";
+import { writeSessionInfo, detectSource } from "../utils/session.js";
 import type { HookInput } from "../types.js";
 import { existsSync, statSync } from "node:fs";
 import { resolve, basename } from "node:path";
@@ -20,8 +21,18 @@ async function main() {
 
     debug(`Session starting: ${hookInput.session_id}`);
 
-    // Get project info without loading SDK
+    // Get project info
     const projectDir = hookInput.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+
+    // Write session info for cross-process session tracking
+    const source = detectSource();
+    try {
+      await writeSessionInfo(projectDir, hookInput.session_id, source);
+      debug(`Session info written: ${hookInput.session_id} (${source})`);
+    } catch (err) {
+      debug(`Failed to write session info: ${err}`);
+    }
+
     const projectName = basename(projectDir);
     const memoryPath = resolve(projectDir, ".claude/mind.mv2");
 

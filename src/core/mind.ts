@@ -187,7 +187,17 @@ export class Mind {
   }
 
   /**
+   * Set session ID (for external session tracking)
+   */
+  setSessionId(sessionId: string): void {
+    this.sessionId = sessionId;
+  }
+
+  /**
    * Remember an observation
+   *
+   * IMPORTANT: Re-opens memvid inside the lock to prevent stale SDK state
+   * when multiple processes write concurrently (Issue #13 fix).
    */
   async remember(input: {
     type: ObservationType;
@@ -196,6 +206,18 @@ export class Mind {
     tool?: string;
     metadata?: Record<string, unknown>;
   }): Promise<string> {
+    // Allow override of sessionId and source from input metadata
+    const effectiveSessionId = (input.metadata?.sessionId as string) || this.sessionId;
+    
+    // Validate source type
+    const VALID_SOURCES = ["opencode", "claude-code"] as const;
+    type Source = typeof VALID_SOURCES[number];
+    const rawSource = input.metadata?.source as string | undefined;
+    const effectiveSource: Source = 
+      rawSource && (VALID_SOURCES as readonly string[]).includes(rawSource)
+        ? (rawSource as Source)
+        : "claude-code";
+
     const observation: Observation = {
       id: generateId(),
       timestamp: Date.now(),
@@ -205,12 +227,18 @@ export class Mind {
       content: input.content,
       metadata: {
         ...input.metadata,
-        sessionId: this.sessionId,
+        sessionId: effectiveSessionId,
+        source: effectiveSource,
       },
     };
 
     const frameId = await this.withLock(async () => {
-      return this.memvid.put({
+      // Re-open memvid to get fresh state (prevents stale SDK state corruption)
+      await loadSDK();
+      const memoryPath = this.getMemoryPath();
+      const freshMemvid = await use("basic", memoryPath);
+
+      return freshMemvid.put({
         title: `[${observation.type}] ${observation.summary}`,
         label: observation.type,
         text: observation.content,
@@ -218,7 +246,8 @@ export class Mind {
           observationId: observation.id,
           timestamp: observation.timestamp,
           tool: observation.tool,
-          sessionId: this.sessionId,
+          sessionId: effectiveSessionId,
+          source: effectiveSource,
           ...observation.metadata,
         },
         tags: [observation.type, observation.tool].filter(Boolean) as string[],
@@ -334,6 +363,8 @@ export class Mind {
 
   /**
    * Save a session summary
+   *
+   * IMPORTANT: Re-opens memvid inside the lock to prevent stale SDK state.
    */
   async saveSessionSummary(summary: {
     keyDecisions: string[];
@@ -351,11 +382,19 @@ export class Mind {
     };
 
     return this.withLock(async () => {
-      return this.memvid.put({
+      // Re-open memvid to get fresh state (prevents stale SDK state corruption)
+      await loadSDK();
+      const memoryPath = this.getMemoryPath();
+      const freshMemvid = await use("basic", memoryPath);
+
+      return freshMemvid.put({
         title: `Session Summary: ${new Date().toISOString().split("T")[0]}`,
         label: "session",
         text: JSON.stringify(sessionSummary, null, 2),
-        metadata: sessionSummary as unknown as Record<string, unknown>,
+        metadata: {
+          ...sessionSummary as unknown as Record<string, unknown>,
+          source: "claude-code",
+        },
         tags: ["session", "summary"],
       });
     });

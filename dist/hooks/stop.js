@@ -166,9 +166,22 @@ var Mind = class _Mind {
     return withMemvidLock(lockPath, fn);
   }
   /**
+   * Set session ID (for external session tracking)
+   */
+  setSessionId(sessionId) {
+    this.sessionId = sessionId;
+  }
+  /**
    * Remember an observation
+   *
+   * IMPORTANT: Re-opens memvid inside the lock to prevent stale SDK state
+   * when multiple processes write concurrently (Issue #13 fix).
    */
   async remember(input) {
+    const effectiveSessionId = input.metadata?.sessionId || this.sessionId;
+    const VALID_SOURCES = ["opencode", "claude-code"];
+    const rawSource = input.metadata?.source;
+    const effectiveSource = rawSource && VALID_SOURCES.includes(rawSource) ? rawSource : "claude-code";
     const observation = {
       id: generateId(),
       timestamp: Date.now(),
@@ -178,11 +191,15 @@ var Mind = class _Mind {
       content: input.content,
       metadata: {
         ...input.metadata,
-        sessionId: this.sessionId
+        sessionId: effectiveSessionId,
+        source: effectiveSource
       }
     };
     const frameId = await this.withLock(async () => {
-      return this.memvid.put({
+      await loadSDK();
+      const memoryPath = this.getMemoryPath();
+      const freshMemvid = await use("basic", memoryPath);
+      return freshMemvid.put({
         title: `[${observation.type}] ${observation.summary}`,
         label: observation.type,
         text: observation.content,
@@ -190,7 +207,8 @@ var Mind = class _Mind {
           observationId: observation.id,
           timestamp: observation.timestamp,
           tool: observation.tool,
-          sessionId: this.sessionId,
+          sessionId: effectiveSessionId,
+          source: effectiveSource,
           ...observation.metadata
         },
         tags: [observation.type, observation.tool].filter(Boolean)
@@ -284,6 +302,8 @@ var Mind = class _Mind {
   }
   /**
    * Save a session summary
+   *
+   * IMPORTANT: Re-opens memvid inside the lock to prevent stale SDK state.
    */
   async saveSessionSummary(summary) {
     const sessionSummary = {
@@ -298,11 +318,17 @@ var Mind = class _Mind {
       summary: summary.summary
     };
     return this.withLock(async () => {
-      return this.memvid.put({
+      await loadSDK();
+      const memoryPath = this.getMemoryPath();
+      const freshMemvid = await use("basic", memoryPath);
+      return freshMemvid.put({
         title: `Session Summary: ${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}`,
         label: "session",
         text: JSON.stringify(sessionSummary, null, 2),
-        metadata: sessionSummary,
+        metadata: {
+          ...sessionSummary,
+          source: "claude-code"
+        },
         tags: ["session", "summary"]
       });
     });

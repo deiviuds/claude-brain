@@ -5,6 +5,8 @@
  * Captures observations after each tool execution.
  * Uses ENDLESS MODE compression to store 20x more context.
  * Intelligently extracts key learnings and stores them for future sessions.
+ * 
+ * Fix for Issue #13: Uses cross-process deduplication and session tracking.
  */
 
 import { getMind } from "../core/mind.js";
@@ -18,6 +20,8 @@ import {
   compressToolOutput,
   getCompressionStats,
 } from "../utils/compression.js";
+import { isDuplicateAcrossProcesses } from "../utils/dedup.js";
+import { detectSource, getSessionId } from "../utils/session.js";
 import type { HookInput } from "../types.js";
 
 // Tools worth capturing observations from
@@ -37,35 +41,6 @@ const OBSERVED_TOOLS = new Set([
 
 // Minimum output length to consider capturing
 const MIN_OUTPUT_LENGTH = 50;
-
-// Simple in-memory dedup cache to avoid storing duplicate observations
-// Key: hash of tool+input, Value: timestamp of last capture
-const recentObservations = new Map<string, number>();
-const DEDUP_WINDOW_MS = 60000; // 1 minute - don't re-capture same thing within this window
-
-function getObservationKey(toolName: string, toolInput: Record<string, unknown> | undefined): string {
-  const inputStr = toolInput ? JSON.stringify(toolInput).slice(0, 200) : "";
-  return `${toolName}:${inputStr}`;
-}
-
-function isDuplicate(key: string): boolean {
-  const lastSeen = recentObservations.get(key);
-  if (!lastSeen) return false;
-  return Date.now() - lastSeen < DEDUP_WINDOW_MS;
-}
-
-function markObserved(key: string): void {
-  recentObservations.set(key, Date.now());
-  // Clean old entries
-  if (recentObservations.size > 100) {
-    const now = Date.now();
-    for (const [k, v] of recentObservations.entries()) {
-      if (now - v > DEDUP_WINDOW_MS * 2) {
-        recentObservations.delete(k);
-      }
-    }
-  }
-}
 
 // Tools that should ALWAYS be captured regardless of output length
 const ALWAYS_CAPTURE_TOOLS = new Set(["Edit", "Write", "Update", "NotebookEdit"]);
@@ -91,10 +66,13 @@ async function main() {
       return;
     }
 
-    // Deduplication check - avoid storing the same observation within a short window
-    const dedupKey = getObservationKey(tool_name, tool_input);
-    if (isDuplicate(dedupKey)) {
-      debug(`Skipping duplicate observation: ${tool_name}`);
+    // Get project directory and source for cross-process coordination
+    const projectDir = hookInput.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+    const source = detectSource();
+
+    // Cross-process deduplication check (Issue #13 fix)
+    if (await isDuplicateAcrossProcesses(projectDir, source, tool_name, tool_input || {})) {
+      debug(`Skipping duplicate observation (cross-process): ${tool_name}`);
       writeOutput({ continue: true });
       return;
     }
@@ -145,6 +123,9 @@ async function main() {
     // Initialize mind
     const mind = await getMind();
 
+    // Get persistent session ID (Issue #13 fix - consistent session tracking)
+    const sessionId = await getSessionId(projectDir, hookInput.session_id);
+
     // Extract and classify the observation
     const observationType = classifyObservationType(tool_name, compressed);
 
@@ -156,13 +137,15 @@ async function main() {
       ? compressed.slice(0, MAX_OUTPUT_LENGTH) + "\n... (compressed)"
       : compressed;
 
-    // Extract metadata with compression flag
+    // Extract metadata with compression flag and source tracking
     const metadata = extractMetadata(tool_name, tool_input);
     if (wasCompressed) {
       metadata.compressed = true;
       metadata.originalSize = originalSize;
       metadata.compressedSize = compressed.length;
     }
+    metadata.sessionId = sessionId;
+    metadata.source = source;
 
     // Store the observation
     await mind.remember({
@@ -172,9 +155,6 @@ async function main() {
       tool: tool_name,
       metadata,
     });
-
-    // Mark as observed for deduplication
-    markObserved(dedupKey);
 
     debug(`Stored: [${observationType}] ${summary}${wasCompressed ? " (compressed)" : ""}`);
 

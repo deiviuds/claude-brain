@@ -129,7 +129,14 @@ declare class Mind {
     static open(configOverrides?: Partial<MindConfig>): Promise<Mind>;
     private withLock;
     /**
+     * Set session ID (for external session tracking)
+     */
+    setSessionId(sessionId: string): void;
+    /**
      * Remember an observation
+     *
+     * IMPORTANT: Re-opens memvid inside the lock to prevent stale SDK state
+     * when multiple processes write concurrently (Issue #13 fix).
      */
     remember(input: {
         type: ObservationType;
@@ -153,6 +160,8 @@ declare class Mind {
     getContext(query?: string): Promise<InjectedContext>;
     /**
      * Save a session summary
+     *
+     * IMPORTANT: Re-opens memvid inside the lock to prevent stale SDK state.
      */
     saveSessionSummary(summary: {
         keyDecisions: string[];

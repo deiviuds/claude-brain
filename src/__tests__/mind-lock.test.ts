@@ -1,12 +1,15 @@
 import { describe, it, expect } from "vitest";
 import { Mind } from "../core/mind.js";
-import { mkdtempSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 function makeTempMemoryPath(): { dir: string; path: string } {
   const dir = mkdtempSync(join(tmpdir(), "claude-brain-lock-"));
-  return { dir, path: join(dir, "mind.mv2") };
+  // Create .claude subdirectory
+  const claudeDir = join(dir, ".claude");
+  mkdirSync(claudeDir, { recursive: true });
+  return { dir, path: join(claudeDir, "mind.mv2") };
 }
 
 async function writeOnce(memoryPath: string, i: number): Promise<void> {
@@ -51,10 +54,64 @@ describe("Mind concurrent access", () => {
       const stats = await mind.stats();
       expect(stats.totalObservations).toBe(writes);
 
-      const backups = readdirSync(dir).filter((f) => f.includes(".backup-"));
+      const claudeDir = join(dir, ".claude");
+      const backups = readdirSync(claudeDir).filter((f) => f.includes(".backup-"));
       expect(backups.length).toBe(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 15000);
+
+  it("distinguishes observations by source tool", async () => {
+    const { dir, path } = makeTempMemoryPath();
+    try {
+      // Simulate Claude Code observation
+      const mind1 = await Mind.open({ memoryPath: path, debug: false });
+      await mind1.remember({
+        type: "discovery",
+        summary: "Read file.ts",
+        content: "file contents from claude-code",
+        metadata: { source: "claude-code", sessionId: "cc-session-1" },
+      });
+
+      // Simulate OpenCode observation (same file)
+      const mind2 = await Mind.open({ memoryPath: path, debug: false });
+      await mind2.remember({
+        type: "discovery",
+        summary: "Read file.ts",
+        content: "file contents from opencode",
+        metadata: { source: "opencode", sessionId: "oc-session-1" },
+      });
+
+      const mind = await Mind.open({ memoryPath: path, debug: false });
+      const stats = await mind.stats();
+
+      // Both should be stored (different sources)
+      expect(stats.totalObservations).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts sessionId from metadata and stores it", async () => {
+    const { dir, path } = makeTempMemoryPath();
+    try {
+      const sessionId = "test-session-123";
+
+      // Write with explicit sessionId in metadata
+      const mind = await Mind.open({ memoryPath: path, debug: false });
+      await mind.remember({
+        type: "discovery",
+        summary: "test with custom session",
+        content: "content with session id",
+        metadata: { sessionId },
+      });
+
+      // Verify observation was stored
+      const stats = await mind.stats();
+      expect(stats.totalObservations).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

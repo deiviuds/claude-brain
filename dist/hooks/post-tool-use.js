@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { readdirSync, unlinkSync, existsSync } from 'fs';
-import { resolve, dirname } from 'path';
-import { mkdir, open } from 'fs/promises';
-import { randomBytes } from 'crypto';
+import { existsSync, readdirSync, unlinkSync } from 'fs';
+import { dirname, resolve } from 'path';
+import { mkdir, open, readFile, writeFile } from 'fs/promises';
+import { createHash, randomBytes } from 'crypto';
 import lockfile from 'proper-lockfile';
 
 // src/types.ts
@@ -192,9 +192,22 @@ var Mind = class _Mind {
     return withMemvidLock(lockPath, fn);
   }
   /**
+   * Set session ID (for external session tracking)
+   */
+  setSessionId(sessionId) {
+    this.sessionId = sessionId;
+  }
+  /**
    * Remember an observation
+   *
+   * IMPORTANT: Re-opens memvid inside the lock to prevent stale SDK state
+   * when multiple processes write concurrently (Issue #13 fix).
    */
   async remember(input) {
+    const effectiveSessionId = input.metadata?.sessionId || this.sessionId;
+    const VALID_SOURCES = ["opencode", "claude-code"];
+    const rawSource = input.metadata?.source;
+    const effectiveSource = rawSource && VALID_SOURCES.includes(rawSource) ? rawSource : "claude-code";
     const observation = {
       id: generateId(),
       timestamp: Date.now(),
@@ -204,11 +217,15 @@ var Mind = class _Mind {
       content: input.content,
       metadata: {
         ...input.metadata,
-        sessionId: this.sessionId
+        sessionId: effectiveSessionId,
+        source: effectiveSource
       }
     };
     const frameId = await this.withLock(async () => {
-      return this.memvid.put({
+      await loadSDK();
+      const memoryPath = this.getMemoryPath();
+      const freshMemvid = await use("basic", memoryPath);
+      return freshMemvid.put({
         title: `[${observation.type}] ${observation.summary}`,
         label: observation.type,
         text: observation.content,
@@ -216,7 +233,8 @@ var Mind = class _Mind {
           observationId: observation.id,
           timestamp: observation.timestamp,
           tool: observation.tool,
-          sessionId: this.sessionId,
+          sessionId: effectiveSessionId,
+          source: effectiveSource,
           ...observation.metadata
         },
         tags: [observation.type, observation.tool].filter(Boolean)
@@ -270,7 +288,7 @@ var Mind = class _Mind {
         reverse: true
       });
       const frames = Array.isArray(timeline) ? timeline : timeline.frames || [];
-      const recentObservations2 = frames.map(
+      const recentObservations = frames.map(
         (frame) => {
           let ts = frame.metadata?.timestamp || frame.timestamp || 0;
           if (ts > 0 && ts < 4102444800) {
@@ -293,14 +311,14 @@ var Mind = class _Mind {
         relevantMemories = searchResults.map((r) => r.observation);
       }
       let tokenCount = 0;
-      for (const obs of recentObservations2) {
+      for (const obs of recentObservations) {
         const text = `[${obs.type}] ${obs.summary}`;
         const tokens = estimateTokens(text);
         if (tokenCount + tokens > this.config.maxContextTokens) break;
         tokenCount += tokens;
       }
       return {
-        recentObservations: recentObservations2,
+        recentObservations,
         relevantMemories,
         sessionSummaries: [],
         // TODO: Implement session summaries
@@ -310,6 +328,8 @@ var Mind = class _Mind {
   }
   /**
    * Save a session summary
+   *
+   * IMPORTANT: Re-opens memvid inside the lock to prevent stale SDK state.
    */
   async saveSessionSummary(summary) {
     const sessionSummary = {
@@ -324,11 +344,17 @@ var Mind = class _Mind {
       summary: summary.summary
     };
     return this.withLock(async () => {
-      return this.memvid.put({
+      await loadSDK();
+      const memoryPath = this.getMemoryPath();
+      const freshMemvid = await use("basic", memoryPath);
+      return freshMemvid.put({
         title: `Session Summary: ${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}`,
         label: "session",
         text: JSON.stringify(sessionSummary, null, 2),
-        metadata: sessionSummary,
+        metadata: {
+          ...sessionSummary,
+          source: "claude-code"
+        },
         tags: ["session", "summary"]
       });
     });
@@ -656,6 +682,59 @@ function getCompressionStats(originalSize, compressedSize) {
   const savedPercent = (saved / originalSize * 100).toFixed(1);
   return { ratio, saved, savedPercent };
 }
+var DEDUP_WINDOW_MS = 6e4;
+function getDedupPath(directory) {
+  return `${directory}/.claude/mind-dedup.log`;
+}
+async function isDuplicateAcrossProcesses(directory, source, toolName, toolInput) {
+  const hash = createHash("md5").update(`${source}:${toolName}:${JSON.stringify(toolInput).slice(0, 200)}`).digest("hex");
+  const dedupPath = getDedupPath(directory);
+  const lockPath = `${dedupPath}.lock`;
+  await mkdir(dirname(dedupPath), { recursive: true });
+  return withMemvidLock(lockPath, async () => {
+    const content = await readFile(dedupPath, "utf8").catch(() => "");
+    const now = Date.now();
+    const entries = content.trim().split("\n").filter(Boolean).map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    }).filter((e) => e !== null && now - e.timestamp < DEDUP_WINDOW_MS);
+    if (entries.some((e) => e.hash === hash)) {
+      return true;
+    }
+    entries.push({ timestamp: now, hash, source });
+    await writeFile(dedupPath, entries.map((e) => JSON.stringify(e)).join("\n"));
+    return false;
+  });
+}
+function getSessionPath(directory, source) {
+  return `${directory}/.claude/mind-session-${source}.json`;
+}
+function detectSource() {
+  if (process.env.OPENCODE_SESSION_ID) return "opencode";
+  if (process.env.OPENCODE_DIR) return "opencode";
+  if (process.env.CLAUDE_PROJECT_DIR && !process.env.OPENCODE_SESSION_ID) return "claude-code";
+  return "claude-code";
+}
+async function readSessionInfo(directory, source) {
+  const sessionPath = getSessionPath(directory, source);
+  try {
+    const content = await readFile(sessionPath, "utf8");
+    return JSON.parse(content);
+  } catch {
+    return null;
+  }
+}
+async function getSessionId(directory, fallbackId) {
+  const source = detectSource();
+  const info = await readSessionInfo(directory, source);
+  if (info?.sessionId) {
+    return info.sessionId;
+  }
+  return fallbackId || `${source}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 // src/hooks/post-tool-use.ts
 var OBSERVED_TOOLS = /* @__PURE__ */ new Set([
@@ -673,28 +752,6 @@ var OBSERVED_TOOLS = /* @__PURE__ */ new Set([
   "NotebookEdit"
 ]);
 var MIN_OUTPUT_LENGTH = 50;
-var recentObservations = /* @__PURE__ */ new Map();
-var DEDUP_WINDOW_MS = 6e4;
-function getObservationKey(toolName, toolInput) {
-  const inputStr = toolInput ? JSON.stringify(toolInput).slice(0, 200) : "";
-  return `${toolName}:${inputStr}`;
-}
-function isDuplicate(key) {
-  const lastSeen = recentObservations.get(key);
-  if (!lastSeen) return false;
-  return Date.now() - lastSeen < DEDUP_WINDOW_MS;
-}
-function markObserved(key) {
-  recentObservations.set(key, Date.now());
-  if (recentObservations.size > 100) {
-    const now = Date.now();
-    for (const [k, v] of recentObservations.entries()) {
-      if (now - v > DEDUP_WINDOW_MS * 2) {
-        recentObservations.delete(k);
-      }
-    }
-  }
-}
 var ALWAYS_CAPTURE_TOOLS = /* @__PURE__ */ new Set(["Edit", "Write", "Update", "NotebookEdit"]);
 var MAX_OUTPUT_LENGTH = 2500;
 async function main() {
@@ -708,9 +765,10 @@ async function main() {
       writeOutput({ continue: true });
       return;
     }
-    const dedupKey = getObservationKey(tool_name, tool_input);
-    if (isDuplicate(dedupKey)) {
-      debug(`Skipping duplicate observation: ${tool_name}`);
+    const projectDir = hookInput.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+    const source = detectSource();
+    if (await isDuplicateAcrossProcesses(projectDir, source, tool_name, tool_input || {})) {
+      debug(`Skipping duplicate observation (cross-process): ${tool_name}`);
       writeOutput({ continue: true });
       return;
     }
@@ -743,6 +801,7 @@ Tool: ${tool_name}`;
     }
     debug(`Capturing observation from ${tool_name}`);
     const mind = await getMind();
+    const sessionId = await getSessionId(projectDir, hookInput.session_id);
     const observationType = classifyObservationType(tool_name, compressed);
     const summary = generateSummary(tool_name, tool_input, effectiveOutput);
     const content = compressed.length > MAX_OUTPUT_LENGTH ? compressed.slice(0, MAX_OUTPUT_LENGTH) + "\n... (compressed)" : compressed;
@@ -752,6 +811,8 @@ Tool: ${tool_name}`;
       metadata.originalSize = originalSize;
       metadata.compressedSize = compressed.length;
     }
+    metadata.sessionId = sessionId;
+    metadata.source = source;
     await mind.remember({
       type: observationType,
       summary,
@@ -759,7 +820,6 @@ Tool: ${tool_name}`;
       tool: tool_name,
       metadata
     });
-    markObserved(dedupKey);
     debug(`Stored: [${observationType}] ${summary}${wasCompressed ? " (compressed)" : ""}`);
     writeOutput({ continue: true });
   } catch (error) {
